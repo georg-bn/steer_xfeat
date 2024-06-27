@@ -84,7 +84,7 @@ def alike_distill_loss(kpts, img):
         offsets =  offsets[:, 0] + 8*offsets[:, 1]  # Linear IDX
         labels[(alike_kpts[:,1]/8).long(), (alike_kpts[:,0]/8).long()] = offsets
 
-    kpts = kpts.view(-1,C)
+    kpts = kpts.reshape(-1, C)
     labels = labels.view(-1)
 
     mask = labels < 64
