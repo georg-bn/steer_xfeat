@@ -102,7 +102,7 @@ def alike_distill_loss(kpts, img):
         acc =  (labels == predicted)
         acc = acc.sum() / len(acc)
 
-    kpts = F.log_softmax(kpts)
+    kpts = F.log_softmax(kpts, dim=-1)
     loss = F.nll_loss(kpts, labels, reduction = 'mean')
 
     return loss, acc
