@@ -34,6 +34,8 @@ def parse_arguments():
                         default=(800, 608), help='Training resolution as width,height. Default is (800, 608).')
     parser.add_argument('--device_num', type=str, default='0',
                         help='Device number to use for training. Default is "0".')
+    parser.add_argument('--num_workers', type=int, default=0,
+                        help='Number of workers in DataLoader. Default is 0.')
     parser.add_argument('--dry_run', action='store_true',
                         help='If set, perform a dry run training with a mini-batch for sanity check.')
     parser.add_argument('--save_ckpt_every', type=int, default=500,
@@ -79,7 +81,7 @@ class Trainer():
                        model_name = 'xfeat_default',
                        batch_size = 10, n_steps = 160_000, lr= 3e-4, gamma_steplr=0.5, 
                        training_res = (800, 608), device_num="0", dry_run = False,
-                       save_ckpt_every = 500, steer90=False):
+                       save_ckpt_every = 500, steer90=False, num_workers=0):
 
         self.dev = torch.device ('cuda' if torch.cuda.is_available() else 'cpu')
         self.net = XFeatModel().to(self.dev)
@@ -123,6 +125,7 @@ class Trainer():
 
             self.data_loader = DataLoader(data, 
                                           batch_size=int(self.batch_size * 0.6 if model_name=='xfeat_default' else batch_size),
+                                          num_workers=num_workers,
                                           shuffle=True)
             self.data_iter = iter(self.data_loader)
 
@@ -339,6 +342,7 @@ if __name__ == '__main__':
         device_num=args.device_num,
         dry_run=args.dry_run,
         save_ckpt_every=args.save_ckpt_every,
+        num_workers=args.num_workers,
     )
 
     #The most fun part
