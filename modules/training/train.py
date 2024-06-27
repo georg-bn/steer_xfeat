@@ -28,6 +28,8 @@ def parse_arguments():
                         help='Learning rate. Default is 0.0003.')
     parser.add_argument('--gamma_steplr', type=float, default=0.5,
                         help='Gamma value for StepLR scheduler. Default is 0.5.')
+    parser.add_argument('--steer90', action='store_true',
+                        help='If set, train with 90 deg rotation augmentation and a permutation steerer.')
     parser.add_argument('--training_res', type=lambda s: tuple(map(int, s.split(','))),
                         default=(800, 608), help='Training resolution as width,height. Default is (800, 608).')
     parser.add_argument('--device_num', type=str, default='0',
@@ -77,7 +79,7 @@ class Trainer():
                        model_name = 'xfeat_default',
                        batch_size = 10, n_steps = 160_000, lr= 3e-4, gamma_steplr=0.5, 
                        training_res = (800, 608), device_num="0", dry_run = False,
-                       save_ckpt_every = 500):
+                       save_ckpt_every = 500, steer90=False):
 
         self.dev = torch.device ('cuda' if torch.cuda.is_available() else 'cpu')
         self.net = XFeatModel().to(self.dev)
@@ -137,9 +139,18 @@ class Trainer():
         self.writer = SummaryWriter(ckpt_save_path + f'/logdir/{model_name}_' + time.strftime("%Y_%m_%d-%H_%M_%S"))
         self.model_name = model_name
 
+        self.steer90 = steer90
+        if self.steer90:
+            self.kpts_permutation = {}  # permutation for local kpt grid when the image is rotated
+            for k in [1, 2, 3]:
+                self.kpts_permutation[k] = torch.arange(64).reshape(8, 8).rot90(k).reshape(64)
+                self.kpts_permutation[k] = torch.cat([self.kpts_permutation[k], torch.tensor([64])])  # dustbin
+            self.steer_permutation = {}  # permutation for features when the image is rotated
+            for k in [1, 2, 3]:
+                self.steer_permutation[k] = torch.arange(64).reshape(16, 4).roll(k, dims=1).reshape(64)
+
 
     def train(self):
-
         self.net.train()
 
         difficulty = 0.10
@@ -214,8 +225,30 @@ class Trainer():
                     continue
 
                 #Forward pass
-                feats1, kpts1, hmap1 = self.net(p1)
-                feats2, kpts2, hmap2 = self.net(p2)
+                if self.steer90:
+                    rot1 = np.random.randint(4)
+                    rot2 = np.random.randint(4)
+                    rot_1to2 = (rot2 - rot1) % 4
+                    # extract from rotated images
+                    feats1, kpts1, hmap1 = self.net(p1.rot90(k=rot1, dims=(-2, -1)))
+                    feats2, kpts2, hmap2 = self.net(p2.rot90(k=rot2, dims=(-2, -1)))
+                    # rotate back extractions
+                    if rot1 > 0:
+                        feats1 = feats1.rot90(k=-rot1, dims=(-2, -1))
+                        hmap1 = hmap1.rot90(k=-rot1, dims=(-2, -1))
+                        kpts1 = kpts1.rot90(k=-rot1, dims=(-2, -1))
+                        kpts1 = kpts1[:, self.kpts_permutation[4-rot1]]  # this rotates the predicted fine keypoint grid
+                    if rot2 > 0:
+                        feats2 = feats2.rot90(k=-rot2, dims=(-2, -1))
+                        hmap2 = hmap2.rot90(k=-rot2, dims=(-2, -1))
+                        kpts2 = kpts2.rot90(k=-rot2, dims=(-2, -1))
+                        kpts2 = kpts2[:, self.kpts_permutation[4-rot2]]
+                    # steer feats1 to compensate for relative rotation
+                    if rot_1to2 > 0:
+                        feats1 = feats1[:, self.steer_permutation[rot_1to2]]
+                else:
+                    feats1, kpts1, hmap1 = self.net(p1)
+                    feats2, kpts2, hmap2 = self.net(p2)
 
                 loss_items = []
 
@@ -301,10 +334,11 @@ if __name__ == '__main__':
         n_steps=args.n_steps,
         lr=args.lr,
         gamma_steplr=args.gamma_steplr,
+        steer90=args.steer90,
         training_res=args.training_res,
         device_num=args.device_num,
         dry_run=args.dry_run,
-        save_ckpt_every=args.save_ckpt_every
+        save_ckpt_every=args.save_ckpt_every,
     )
 
     #The most fun part
