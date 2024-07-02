@@ -17,6 +17,8 @@ def parse_arguments():
                         help='Path to the synthetic dataset root directory.')
     parser.add_argument('--ckpt_save_path', type=str, required=True,
                         help='Path to save the checkpoints.')
+    parser.add_argument('--experiment_id', type=str, default='0',
+                        help='Id of experiment, for logging.')
     parser.add_argument('--training_type', type=str, default='xfeat_default',
                         choices=['xfeat_default', 'xfeat_synthetic', 'xfeat_megadepth'],
                         help='Training scheme. xfeat_default uses both megadepth & synthetic warps.')
@@ -30,6 +32,8 @@ def parse_arguments():
                         help='Gamma value for StepLR scheduler. Default is 0.5.')
     parser.add_argument('--steer90', action='store_true',
                         help='If set, train with 90 deg rotation augmentation and a permutation steerer.')
+    parser.add_argument('--learnable_steer90', action='store_true',
+                        help='If set, train with 90 deg rotation augmentation and a learned steerer.')
     parser.add_argument('--training_res', type=lambda s: tuple(map(int, s.split(','))),
                         default=(800, 608), help='Training resolution as width,height. Default is (800, 608).')
     parser.add_argument('--device_num', type=str, default='0',
@@ -38,6 +42,10 @@ def parse_arguments():
                         help='Number of workers in DataLoader. Default is 0.')
     parser.add_argument('--dry_run', action='store_true',
                         help='If set, perform a dry run training with a mini-batch for sanity check.')
+    parser.add_argument('--pretrained_weights', type=str, default=None,
+                        help='Path to pretrained weights for initialization. Default is None.')
+    parser.add_argument('--train_only_descriptor', action='store_true',
+                        help='If set, train only descriptor part of network.')
     parser.add_argument('--save_ckpt_every', type=int, default=500,
                         help='Save checkpoints every N steps. Default is 500.')
 
@@ -76,21 +84,27 @@ class Trainer():
     """
 
     def __init__(self, megadepth_root_path, 
-                       synthetic_root_path, 
-                       ckpt_save_path, 
-                       model_name = 'xfeat_default',
-                       batch_size = 10, n_steps = 160_000, lr= 3e-4, gamma_steplr=0.5, 
-                       training_res = (800, 608), device_num="0", dry_run = False,
-                       save_ckpt_every = 500, steer90=False, num_workers=0):
+                 synthetic_root_path, 
+                 ckpt_save_path, 
+                 experiment_id,
+                 pretrained_weights=None,
+                 train_only_descriptor=False,
+                 model_name = 'xfeat_default',
+                 batch_size = 10, n_steps = 160_000, lr= 3e-4, gamma_steplr=0.5, 
+                 training_res = (800, 608), device_num="0", dry_run = False,
+                 save_ckpt_every = 500, steer90=False, learnable_steer90=False,
+                 num_workers=0):
 
         self.dev = torch.device ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.net = XFeatModel().to(self.dev)
+        self.net = XFeatModel()
+        if pretrained_weights is not None:
+            self.net.load_state_dict(torch.load(pretrained_weights))
+        self.net.to(self.dev)
 
         #Setup optimizer 
         self.batch_size = batch_size
         self.steps = n_steps
-        self.opt = optim.Adam(filter(lambda x: x.requires_grad, self.net.parameters()) , lr = lr)
-        self.scheduler = torch.optim.lr_scheduler.StepLR(self.opt, step_size=30_000, gamma=gamma_steplr)
+        self.train_only_descriptor = train_only_descriptor
 
         ##################### Synthetic COCO INIT ##########################
         if model_name in ('xfeat_default', 'xfeat_synthetic'):
@@ -139,18 +153,39 @@ class Trainer():
         self.dry_run = dry_run
         self.save_ckpt_every = save_ckpt_every
         self.ckpt_save_path = ckpt_save_path
-        self.writer = SummaryWriter(ckpt_save_path + f'/logdir/{model_name}_' + time.strftime("%Y_%m_%d-%H_%M_%S"))
+        if learnable_steer90 and steer90:
+            raise ValueError()
+        if learnable_steer90:
+            self.writer = SummaryWriter(ckpt_save_path + f'/logdir/{experiment_id}_{model_name}_learnable_steer90_' + time.strftime("%Y_%m_%d-%H_%M_%S"))
+        elif steer90:
+            self.writer = SummaryWriter(ckpt_save_path + f'/logdir/{experiment_id}_{model_name}_steer90_' + time.strftime("%Y_%m_%d-%H_%M_%S"))
+        else:
+            self.writer = SummaryWriter(ckpt_save_path + f'/logdir/{experiment_id}_{model_name}_' + time.strftime("%Y_%m_%d-%H_%M_%S"))
         self.model_name = model_name
 
         self.steer90 = steer90
-        if self.steer90:
+        self.learnable_steer90 = learnable_steer90
+        if self.steer90 or learnable_steer90:
             self.kpts_permutation = {}  # permutation for local kpt grid when the image is rotated
             for k in [1, 2, 3]:
                 self.kpts_permutation[k] = torch.arange(64).reshape(8, 8).rot90(k).reshape(64)
                 self.kpts_permutation[k] = torch.cat([self.kpts_permutation[k], torch.tensor([64])])  # dustbin
+        if self.steer90:
             self.steer_permutation = {}  # permutation for features when the image is rotated
             for k in [1, 2, 3]:
-                self.steer_permutation[k] = torch.arange(64).reshape(16, 4).roll(k, dims=1).reshape(64)
+                self.steer_permutation[k] = torch.arange(64).reshape(4, 16).roll(k, dims=0).reshape(64)
+        elif self.learnable_steer90:
+            self.steerer = nn.Conv2d(64, 64, kernel_size=1, padding=0, stride=1, bias=False).to(self.dev)
+
+        # SETUP OPTIMIZER
+        if self.train_only_descriptor:
+            for x in self.net.keypoint_head.parameters():
+                x.requires_grad = False
+        if self.learnable_steer90:
+            self.opt = optim.Adam([*self.steerer.parameters()] + [x for x in self.net.parameters() if x.requires_grad], lr = lr)
+        else:
+            self.opt = optim.Adam([x for x in self.net.parameters() if x.requires_grad], lr = lr)
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.opt, step_size=30_000, gamma=gamma_steplr)
 
 
     def train(self):
@@ -228,27 +263,39 @@ class Trainer():
                     continue
 
                 #Forward pass
-                if self.steer90:
+                if self.steer90 or self.learnable_steer90:
                     rot1 = np.random.randint(4)
                     rot2 = np.random.randint(4)
-                    rot_1to2 = (rot2 - rot1) % 4
+                    # rot_2to1 = (rot1 - rot2) % 4
                     # extract from rotated images
-                    feats1, kpts1, hmap1 = self.net(p1.rot90(k=rot1, dims=(-2, -1)))
-                    feats2, kpts2, hmap2 = self.net(p2.rot90(k=rot2, dims=(-2, -1)))
+                    p1_rot = p1.rot90(k=rot1, dims=(-2, -1))
+                    p2_rot = p2.rot90(k=rot2, dims=(-2, -1))
+                    feats1, kpts1, hmap1 = self.net(p1_rot)
+                    feats2, kpts2, hmap2 = self.net(p2_rot)
                     # rotate back extractions
                     if rot1 > 0:
-                        feats1 = feats1.rot90(k=-rot1, dims=(-2, -1))
                         hmap1 = hmap1.rot90(k=-rot1, dims=(-2, -1))
                         kpts1 = kpts1.rot90(k=-rot1, dims=(-2, -1))
                         kpts1 = kpts1[:, self.kpts_permutation[4-rot1]]  # this rotates the predicted fine keypoint grid
+                        feats1 = feats1.rot90(k=-rot1, dims=(-2, -1))
+                        if self.steer90:
+                            feats1 = feats1[:, self.steer_permutation[4-rot1]]  # this steers the features in feature space
+                        elif self.learnable_steer90:
+                            for _ in range(4-rot1):
+                                feats1 = self.steerer(feats1)
                     if rot2 > 0:
-                        feats2 = feats2.rot90(k=-rot2, dims=(-2, -1))
                         hmap2 = hmap2.rot90(k=-rot2, dims=(-2, -1))
                         kpts2 = kpts2.rot90(k=-rot2, dims=(-2, -1))
                         kpts2 = kpts2[:, self.kpts_permutation[4-rot2]]
-                    # steer feats1 to compensate for relative rotation
-                    if rot_1to2 > 0:
-                        feats1 = feats1[:, self.steer_permutation[rot_1to2]]
+                        feats2 = feats2.rot90(k=-rot2, dims=(-2, -1))
+                        if self.steer90:
+                            feats2 = feats2[:, self.steer_permutation[4-rot2]]
+                        elif self.learnable_steer90:
+                            for _ in range(4-rot2):
+                                feats2 = self.steerer(feats2)
+                    # steer feats2 to compensate for relative rotation
+                    # if rot_2to1 > 0:
+                    #     feats2 = feats2[:, self.steer_permutation[rot_2to1]]
                 else:
                     feats1, kpts1, hmap1 = self.net(p1)
                     feats2, kpts2, hmap2 = self.net(p2)
@@ -266,23 +313,26 @@ class Trainer():
                     #grab heatmaps at corresponding idxs
                     h1 = hmap1[b, 0, pts1[:,1].long(), pts1[:,0].long()]
                     h2 = hmap2[b, 0, pts2[:,1].long(), pts2[:,0].long()]
+
                     coords1 = self.net.fine_matcher(torch.cat([m1, m2], dim=-1))
 
                     #Compute losses
                     loss_ds, conf = dual_softmax_loss(m1, m2)
                     loss_coords, acc_coords = coordinate_classification_loss(coords1, pts1, pts2, conf)
 
-                    loss_kp_pos1, acc_pos1 = alike_distill_loss(kpts1[b], p1[b])
-                    loss_kp_pos2, acc_pos2 = alike_distill_loss(kpts2[b], p2[b])
-                    loss_kp_pos = (loss_kp_pos1 + loss_kp_pos2)*2.0
-                    acc_pos = (acc_pos1 + acc_pos2)/2
+                    if not self.train_only_descriptor:
+                        loss_kp_pos1, acc_pos1 = alike_distill_loss(kpts1[b], p1[b])
+                        loss_kp_pos2, acc_pos2 = alike_distill_loss(kpts2[b], p2[b])
+                        loss_kp_pos = (loss_kp_pos1 + loss_kp_pos2)*2.0
+                        acc_pos = (acc_pos1 + acc_pos2)/2
 
                     loss_kp =  keypoint_loss(h1, conf) + keypoint_loss(h2, conf)
 
                     loss_items.append(loss_ds.unsqueeze(0))
                     loss_items.append(loss_coords.unsqueeze(0))
                     loss_items.append(loss_kp.unsqueeze(0))
-                    loss_items.append(loss_kp_pos.unsqueeze(0))
+                    if not self.train_only_descriptor:
+                        loss_items.append(loss_kp_pos.unsqueeze(0))
 
                     if b == 0:
                         acc_coarse_0 = check_accuracy(m1, m2)
@@ -294,7 +344,8 @@ class Trainer():
                 loss_coarse = loss_ds.item()
                 loss_coord = loss_coords.item()
                 loss_coord = loss_coords.item()
-                loss_kp_pos = loss_kp_pos.item()
+                if not self.train_only_descriptor:
+                    loss_kp_pos = loss_kp_pos.item()
                 loss_l1 = loss_kp.item()
 
                 # Compute Backward Pass
@@ -307,7 +358,12 @@ class Trainer():
                 if (i+1) % self.save_ckpt_every == 0:
                     print('saving iter ', i+1)
                     torch.save(self.net.state_dict(), self.ckpt_save_path + f'/{self.model_name}_{i+1}.pth')
+                    if self.learnable_steer90:
+                        torch.save(self.steerer.state_dict(), self.ckpt_save_path + f'/steerer_{self.model_name}_{i+1}.pth')
 
+                if self.train_only_descriptor:
+                    loss_kp_pos = np.nan
+                    acc_pos = np.nan
                 pbar.set_description( 'Loss: {:.4f} acc_c0 {:.3f} acc_c1 {:.3f} acc_f: {:.3f} loss_c: {:.3f} loss_f: {:.3f} loss_kp: {:.3f} #matches_c: {:d} loss_kp_pos: {:.3f} acc_kp_pos: {:.3f}'.format(
                                                                         loss.item(), acc_coarse_0, acc_coarse, acc_coords, loss_coarse, loss_coord, loss_l1, nb_coarse, loss_kp_pos, acc_pos) )
                 pbar.update(1)
@@ -332,17 +388,21 @@ if __name__ == '__main__':
         megadepth_root_path=args.megadepth_root_path, 
         synthetic_root_path=args.synthetic_root_path, 
         ckpt_save_path=args.ckpt_save_path,
+        experiment_id=args.experiment_id,
         model_name=args.training_type,
         batch_size=args.batch_size,
         n_steps=args.n_steps,
         lr=args.lr,
         gamma_steplr=args.gamma_steplr,
         steer90=args.steer90,
+        learnable_steer90=args.learnable_steer90,
         training_res=args.training_res,
         device_num=args.device_num,
         dry_run=args.dry_run,
         save_ckpt_every=args.save_ckpt_every,
         num_workers=args.num_workers,
+        pretrained_weights=args.pretrained_weights,
+        train_only_descriptor=args.train_only_descriptor,
     )
 
     #The most fun part
